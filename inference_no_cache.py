@@ -26,3 +26,4 @@ if __name__ == "__main__":
     prompt = "The meaning of life is"
     print(f"Prompt: {prompt}")
     print(f"Generated: {generate(prompt)}")
+    print(model)
