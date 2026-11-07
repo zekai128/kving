@@ -1,14 +1,19 @@
-"""Replay a trace through an engine and record raw per-request and per-step timings.
+"""Serve a trace through an engine and record raw per-request and per-step timings.
 
     python3 bench.py --engine dummy --trace traces/mixed_n200_seed0_rate2.json
+
+Two processes, connected by a queue:
+    client (load generator)  sends each trace request at its arrival time, then a None sentinel
+    server (this process)    drains the queue into the engine, steps it, records timings
 
 Writes results/<engine>__<trace name>.json. All metrics are computed later by analyze.py.
 """
 import argparse
 import json
+import multiprocessing as mp
 import os
+import queue
 import time
-from collections import deque
 from dataclasses import asdict, dataclass, field
 
 from engines import ENGINES, Request
@@ -25,7 +30,7 @@ class RequestRecord:
     id: int
     prompt_len: int
     output_len: int
-    arrival: float               # all times are seconds after the run start
+    arrival: float               # when the client sent it; all times are seconds after the run start
     admit: float | None = None   # start of the step that admitted it
     first_token: float | None = None
     finish: float | None = None
@@ -59,34 +64,58 @@ def warmup(engine, trace_requests, n=3, output_len=8):
     sync()
 
 
-def run(engine, trace_requests):
-    pending = deque(sorted(trace_requests, key=lambda r: r["arrival"]))
-    records = {r["id"]: RequestRecord(id=r["id"], prompt_len=len(r["prompt"]), output_len=r["output_len"],
-                                      arrival=r["arrival"]) for r in trace_requests}
+def client(trace_requests, q):
+    """Load generator. Runs in its own process and sends requests on schedule, whether or
+    not the server is keeping up (open loop).
+
+    Messages: the start time (float), then one dict per request, then None.
+    """
+    start = time.perf_counter()  # CLOCK_MONOTONIC: comparable across processes
+    q.put(start)
+    for r in sorted(trace_requests, key=lambda r: r["arrival"]):
+        delay = start + r["arrival"] - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+        q.put({**r, "sent": time.perf_counter() - start})
+    q.put(None)
+
+
+def run(engine, q):
+    records = {}
     steps = []
     n_added = 0
     n_admitted = 0
+    max_send_lag = 0.0   # how far the client fell behind its schedule
+    client_done = False
 
     if HAS_CUDA:
         torch.cuda.reset_peak_memory_stats()
-    sync()
-    start = time.perf_counter()
+    start = q.get()  # blocks until the client process is up
 
-    while pending or engine.has_work():
-        # 1. Make every request whose arrival time has passed visible to the engine.
-        now = time.perf_counter() - start
-        while pending and pending[0]["arrival"] <= now:
-            r = pending.popleft()
-            engine.add_request(Request(id=r["id"], prompt=r["prompt"], output_len=r["output_len"],
-                                       arrival=r["arrival"]))
+    while not client_done or engine.has_work():
+        # 1. Move every request in the queue to the engine. If the engine is idle, block
+        #    until one arrives (the OS wakes us); otherwise just take what's there.
+        block = not engine.has_work()
+        while not client_done:
+            try:
+                msg = q.get(block=block)
+            except queue.Empty:
+                break
+            block = False
+            if msg is None:
+                client_done = True
+                break
+            records[msg["id"]] = RequestRecord(id=msg["id"], prompt_len=len(msg["prompt"]),
+                                               output_len=msg["output_len"], arrival=msg["sent"])
+            engine.add_request(Request(id=msg["id"], prompt=msg["prompt"], output_len=msg["output_len"],
+                                       arrival=msg["sent"]))
+            max_send_lag = max(max_send_lag, msg["sent"] - msg["arrival"])
             n_added += 1
 
-        # 2. Nothing to do: sleep until the next arrival.
         if not engine.has_work():
-            time.sleep(max(0.0, pending[0]["arrival"] - (time.perf_counter() - start)))
             continue
 
-        # 3. One engine step.
+        # 2. One engine step.
         t0 = time.perf_counter() - start
         result = engine.step()
         sync()
@@ -121,7 +150,7 @@ def run(engine, trace_requests):
 
     wall = time.perf_counter() - start
     peak_mem = torch.cuda.max_memory_allocated() if HAS_CUDA else 0
-    return list(records.values()), steps, wall, peak_mem
+    return list(records.values()), steps, wall, peak_mem, max_send_lag
 
 
 def main():
@@ -138,7 +167,13 @@ def main():
     if not args.no_warmup:
         warmup(engine, trace["requests"])
 
-    records, steps, wall, peak_mem = run(engine, trace["requests"])
+    # spawn, not fork: forking a process that has initialized CUDA is unsafe
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    client_proc = ctx.Process(target=client, args=(trace["requests"], q), daemon=True)
+    client_proc.start()
+    records, steps, wall, peak_mem, max_send_lag = run(engine, q)
+    client_proc.join()
 
     unfinished = [r.id for r in records if r.finish is None]
     if unfinished:
@@ -150,14 +185,14 @@ def main():
     with open(out, "w") as f:
         json.dump({
             "meta": {"engine": args.engine, "trace": args.trace, **trace["meta"],
-                     "wall_time": wall, "peak_mem_bytes": peak_mem},
+                     "wall_time": wall, "peak_mem_bytes": peak_mem, "max_send_lag": max_send_lag},
             "requests": [asdict(r) for r in records],
             "steps": [asdict(s) for s in steps],
         }, f)
 
     n_tokens = sum(len(r.tokens) for r in records)
     print(f"wrote {out}: {len(records)} requests, {len(steps)} steps, {n_tokens} output tokens "
-          f"in {wall:.1f}s ({n_tokens / wall:.0f} tok/s)")
+          f"in {wall:.1f}s ({n_tokens / wall:.0f} tok/s), client max send lag {1000 * max_send_lag:.1f}ms")
 
 
 if __name__ == "__main__":

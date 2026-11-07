@@ -10,6 +10,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import torch
+
 
 @dataclass
 class Request:
@@ -95,8 +97,52 @@ class DummyEngine(Engine):
             self.current = None
         return result
 
+class NoCacheEngine(Engine):
+    """Step 0 baseline: real GPT-2, serial, no KV cache.
+
+    Every step reruns the model on prompt + all generated tokens and keeps only the last
+    position's prediction. Greedy decoding, so its outputs are the correctness reference.
+    """
+
+    def __init__(self):
+        self.model = load_model()
+        self.waiting: deque[Request] = deque()
+        self.current: Request | None = None
+        self.generated: list[int] = []
+
+    def add_request(self, req):
+        self.waiting.append(req)
+
+    def has_work(self):
+        return self.current is not None or bool(self.waiting)
+
+    @torch.no_grad()
+    def step(self):
+        result = StepResult(tokens=[])
+        if self.current is None:
+            self.current = self.waiting.popleft()
+            self.generated = []
+            result.admitted.append(self.current.id)
+
+        req = self.current
+        input_ids = torch.tensor([req.prompt + self.generated], dtype=torch.long,
+                                 device=self.model.device)              # [1, T]
+        logits = self.model(input_ids, use_cache=False).logits          # [1, T, 50257]
+        token = logits[0, -1].argmax().item()                           # waits for the GPU
+
+        self.generated.append(token)
+        result.tokens.append((req.id, token))
+        # No cache: every step processes the whole sequence, so all of it counts as prefill.
+        result.num_prefill_tokens = input_ids.shape[1]
+
+        if len(self.generated) == req.output_len:
+            result.finished.append(req.id)
+            self.current = None
+        return result
+
 
 # name -> zero-argument constructor; add your engines here
 ENGINES = {
     "dummy": DummyEngine,
+    "no_cache": NoCacheEngine,
 }
