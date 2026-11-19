@@ -9,6 +9,8 @@ Every engine version (no cache, serial cache, batching, paging, ...) implements 
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from attention import MyAttention
+from serialpreallockvattention import SerialPreallocKVAttention
 
 import torch
 
@@ -140,9 +142,71 @@ class NoCacheEngine(Engine):
             self.current = None
         return result
 
+def load_prealloc_kv_model(name: str = "gpt2", device: str = "cuda"):
+    from transformers import GPT2LMHeadModel
+    model = GPT2LMHeadModel.from_pretrained(name).to(device)
+    model.eval()
+    for block in model.transformer.h:
+        block.attn = SerialPreallocKVAttention(block.attn)
+    return model
+
+class SerialPreallocKVCacheEngine(Engine):
+    def __init__(self):
+        self.model = load_prealloc_kv_model()
+        self.waiting: deque[Request] = deque()
+        self.current: Request | None = None
+        self.generated: list[int] = []
+
+    def add_request(self, req):
+        self.waiting.append(req)
+
+    def has_work(self):
+        return self.current is not None or bool(self.waiting)
+
+    @torch.no_grad()
+    def step(self):
+        result = StepResult(tokens=[])
+        if self.current is None:
+            self.current = self.waiting.popleft()
+            self.generated = []
+            result.admitted.append(self.current.id)
+
+        req = self.current
+        if not self.generated:
+            prompt_ids = torch.tensor([req.prompt], dtype=torch.long,
+                                 device=self.model.device)              # [1, T]
+            logits = self.model(prompt_ids, prefill=True, use_cache=False).logits   # [1, T, 50257]
+            token = logits[0, -1].argmax().item()                           # waits for the GPU
+
+            self.generated.append(token)
+            result.tokens.append((req.id, token))
+            result.num_prefill_tokens = len(req.prompt)
+        else:
+            decode_id = torch.tensor([[self.generated[-1]]], dtype=torch.long,
+                                      device=self.model.device)            # [1, 1]
+            pos = len(req.prompt) + len(self.generated) - 1    # position of generated[-1] in the full sequence
+            position_ids = torch.tensor([[pos]], dtype=torch.long, device=self.model.device)
+            logits = self.model(decode_id, position_ids=position_ids, prefill=False, cache_pos=pos,
+                                use_cache=False).logits                      # [1, 1, 50257]
+            token = logits[0, -1].argmax().item()                           # waits for the GPU
+
+            self.generated.append(token)
+            result.tokens.append((req.id, token))
+            result.num_decode_tokens = 1
+
+        # positions with K/V in the cache: the prompt plus every generated token except the newest
+        result.kv_tokens_used = len(req.prompt) + len(self.generated) - 1
+        result.kv_tokens_reserved = 1024
+
+        if len(self.generated) == req.output_len:
+            result.finished.append(req.id)
+            self.current = None
+        return result
+
 
 # name -> zero-argument constructor; add your engines here
 ENGINES = {
     "dummy": DummyEngine,
     "no_cache": NoCacheEngine,
+    "serial_kv": SerialPreallocKVCacheEngine,
 }
