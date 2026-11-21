@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from attention import MyAttention
 from serialpreallockvattention import SerialPreallocKVAttention
+from staticbatchpreallockvattention import StaticBatchPreallocKVAttention
 
 import torch
 
@@ -204,9 +205,102 @@ class SerialPreallocKVCacheEngine(Engine):
         return result
 
 
+def load_static_batch_model(max_batch: int, name: str = "gpt2", device: str = "cuda"):
+    from transformers import GPT2LMHeadModel
+    model = GPT2LMHeadModel.from_pretrained(name).to(device)
+    model.eval()
+    for block in model.transformer.h:
+        block.attn = StaticBatchPreallocKVAttention(block.attn, max_batch=max_batch)
+    return model
+
+
+class StaticBatchEngine(Engine):
+    """Step 2: static batching. Take up to max_batch waiting requests, left-pad them into one
+    batch, and run that batch until every request in it finishes. Only then admit the next batch.
+
+    Rows whose request has finished keep running (their outputs are ignored) until the
+    batch ends: that wasted work is what continuous batching (step 3) removes.
+    """
+
+    MAX_SEQ_LEN = 1024
+    PAD_ID = 50256      # any valid token id; the mask stops anything attending to it
+
+    def __init__(self, max_batch: int = 8):
+        self.max_batch = max_batch
+        self.model = load_static_batch_model(max_batch)
+        self.device = self.model.device
+        self.waiting: deque[Request] = deque()
+        self.batch: list[Request] = []          # row i of the cache belongs to batch[i]
+        self.generated: list[list[int]] = []    # generated[i]: tokens produced so far for batch[i]
+        self.pad_len = None                     # [B] long, left-pad length of each row
+        self.T = 0                              # padded prompt length = first decode column
+
+    def add_request(self, req):
+        self.waiting.append(req)
+
+    def has_work(self):
+        return bool(self.batch) or bool(self.waiting)
+
+    def _live(self, i):
+        return len(self.generated[i]) < self.batch[i].output_len
+
+    @torch.no_grad()
+    def step(self):
+        result = StepResult(tokens=[])
+
+        if not self.batch:
+            # ---- admit a new batch and prefill it ----
+            while self.waiting and len(self.batch) < self.max_batch:
+                self.batch.append(self.waiting.popleft())
+            self.generated = [[] for _ in self.batch]
+            result.admitted = [r.id for r in self.batch]
+
+            prompts = [r.prompt for r in self.batch]
+            self.T = max(len(p) for p in prompts)
+            assert self.T + max(r.output_len for r in self.batch) <= self.MAX_SEQ_LEN, "batch exceeds context"
+            self.pad_len = torch.tensor([self.T - len(p) for p in prompts], dtype=torch.long, device=self.device)
+            input_ids = torch.tensor([[self.PAD_ID] * (self.T - len(p)) + p for p in prompts],
+                                     dtype=torch.long, device=self.device)                      # [B, T]
+            position_ids = (torch.arange(self.T, device=self.device)[None, :]
+                            - self.pad_len[:, None]).clamp(min=0)                               # [B, T]
+            logits = self.model(input_ids, position_ids=position_ids, prefill=True,
+                                pad_len=self.pad_len, use_cache=False).logits                   # [B, T, V]
+            result.num_prefill_tokens = sum(len(p) for p in prompts)   # real tokens, padding not counted
+        else:
+            # ---- one decode step for every row (finished rows too; their output is ignored) ----
+            g = len(self.generated[0])                   # every row has stepped the same number of times
+            cache_pos = self.T + g - 1                   # column of the newest token, shared by all rows
+            last = [gen[-1] for gen in self.generated]
+            input_ids = torch.tensor(last, dtype=torch.long, device=self.device)[:, None]       # [B, 1]
+            position_ids = (cache_pos - self.pad_len)[:, None]                                  # [B, 1]
+            logits = self.model(input_ids, position_ids=position_ids, prefill=False,
+                                cache_pos=cache_pos, pad_len=self.pad_len, use_cache=False).logits
+            result.num_decode_tokens = sum(self._live(i) for i in range(len(self.batch)))
+
+        next_tokens = logits[:, -1].argmax(-1).tolist()  # waits for the GPU
+        for i, (req, token) in enumerate(zip(self.batch, next_tokens)):
+            if not self._live(i):
+                self.generated[i].append(token)          # keep lengths equal; not reported
+                continue
+            self.generated[i].append(token)
+            result.tokens.append((req.id, token))
+            if len(self.generated[i]) == req.output_len:
+                result.finished.append(req.id)
+
+        # KV actually used: real cached tokens of unfinished requests. Reserved: the whole buffer.
+        result.kv_tokens_used = sum(len(r.prompt) + len(self.generated[i]) - 1
+                                    for i, r in enumerate(self.batch) if self._live(i))
+        result.kv_tokens_reserved = self.max_batch * self.MAX_SEQ_LEN
+
+        if not any(self._live(i) for i in range(len(self.batch))):
+            self.batch = []
+        return result
+
+
 # name -> zero-argument constructor; add your engines here
 ENGINES = {
     "dummy": DummyEngine,
     "no_cache": NoCacheEngine,
     "serial_kv": SerialPreallocKVCacheEngine,
+    "static_b8": StaticBatchEngine,
 }
